@@ -180,11 +180,16 @@ set(NVCC_FLAGS $ENV{NVCC_FLAGS})
 set(LD_FLAGS $ENV{LD_FLAGS})
 
 # Set global FLAGS
-list(APPEND CC_FLAGS
-  -std=c++11)
+list(APPEND NVCC_FLAGS
+  -I/home/ubuntu/cutlass-3.2.1/include)
 
 list(APPEND NVCC_FLAGS
-  -std=c++11)
+  -I/home/ubuntu/cutlass-3.2.1/tools/util/include)
+
+list(APPEND CC_FLAGS
+  -std=c++17)
+list(APPEND NVCC_FLAGS
+  -std=c++17)
 
 add_compile_options(${CC_FLAGS})
 set(CUDA_NVCC_FLAGS ${CUDA_NVCC_FLAGS} ${NVCC_FLAGS})

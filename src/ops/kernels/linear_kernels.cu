@@ -16,6 +16,8 @@
 #include "flexflow/ops/kernels/linear_kernels.h"
 #include "flexflow/utils/cuda_helper.h"
 
+#include "cutlass/gemm/device/gemm.h"
+
 namespace FlexFlow {
 
 LinearMeta::LinearMeta(FFHandler handler, int batch_size) : OpMeta(handler) {
