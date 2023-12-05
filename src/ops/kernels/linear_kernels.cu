@@ -74,6 +74,146 @@ LinearMeta::~LinearMeta(void) {
 namespace Kernels {
 namespace Linear {
 
+template <typename DT>
+void cublas_forward_kernel(LinearMeta const *m,
+                    void const *input_ptr,
+                    void *output_ptr,
+                    void const *weight_ptr,
+                    void const *bias_ptr,
+                    int in_dim,
+                    int out_dim,
+                    int batch_size,
+                    ffStream_t stream){
+  // additional processing for uploading weights
+  if (m->offload) {
+    // Note that we update weight_ptr when uploading weight
+    if (m->quantization_type != DT_NONE) {
+      cudaMemcpyAsync(m->quantized_weight_ptr,
+                      weight_ptr,
+                      m->quantized_weightSize,
+                      cudaMemcpyHostToDevice,
+                      stream);
+      if (m->quantization_type == DT_INT4) {
+        int parallelism = in_dim * out_dim / 2;
+        decompress_int4_general_weights<DT>
+            <<<GET_BLOCKS(parallelism),
+               min(CUDA_NUM_THREADS, parallelism),
+               0,
+               stream>>>(m->quantized_weight_ptr,
+                         static_cast<DT *>(m->weight_ptr),
+                         in_dim,
+                         in_dim * out_dim);
+      } else {
+        assert(m->quantization_type == DT_INT8);
+        int parallelism = in_dim * out_dim;
+        decompress_int8_general_weights<DT>
+            <<<GET_BLOCKS(parallelism),
+               min(CUDA_NUM_THREADS, parallelism),
+               0,
+               stream>>>(m->quantized_weight_ptr,
+                         static_cast<DT *>(m->weight_ptr),
+                         in_dim,
+                         in_dim * out_dim);
+      }
+
+    } else {
+      cudaMemcpyAsync(m->weight_ptr,
+                      weight_ptr,
+                      in_dim * out_dim * sizeof(DT),
+                      cudaMemcpyHostToDevice,
+                      stream);
+    }
+  }
+  checkCUDA(cublasSetStream(m->handle.blas, stream));
+  checkCUDNN(cudnnSetStream(m->handle.dnn, stream));
+  DT alpha = 1.0f, beta = 0.0f;
+  cudaDataType_t input_type = ff_to_cuda_datatype(m->input_type[0]);
+  cudaDataType_t weight_type = m->offload
+                                   ? ff_to_cuda_datatype(m->weight_ptr_type)
+                                   : ff_to_cuda_datatype(m->weight_type[0]);
+  cudaDataType_t output_type = ff_to_cuda_datatype(m->output_type[0]);
+  assert(input_type == weight_type && weight_type == output_type);
+#if defined(CUDA_VERSION) && (CUDA_VERSION < 11000)
+  cudaDataType_t compute_type = cublas_data_type;
+#else
+  // For best performance, set the default cublas compute type to
+  // CUBLAS_COMPUTE_16F for half precision and to
+  // CUBLAS_COMPUTE_32F_FAST_16F for full precision
+  cublasComputeType_t compute_type = CUBLAS_COMPUTE_16F;
+  if (m->output_type[0] == DT_FLOAT) {
+    compute_type = CUBLAS_COMPUTE_32F_FAST_16F;
+  }
+#endif
+  checkCUDA(cublasGemmEx(m->handle.blas,
+                         CUBLAS_OP_T,
+                         CUBLAS_OP_N,
+                         out_dim,
+                         batch_size,
+                         in_dim,
+                         &alpha,
+                         m->offload ? m->weight_ptr : weight_ptr,
+                         weight_type,
+                         in_dim,
+                         input_ptr,
+                         input_type,
+                         in_dim,
+                         &beta,
+                         output_ptr,
+                         output_type,
+                         out_dim,
+                         compute_type,
+                         CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+  // use_bias = True
+  if (bias_ptr != NULL) {
+    checkCUDA(cublasGemmEx(m->handle.blas,
+                           CUBLAS_OP_T,
+                           CUBLAS_OP_N,
+                           out_dim,
+                           batch_size,
+                           1,
+                           &alpha,
+                           bias_ptr,
+                           weight_type,
+                           1,
+                           static_cast<DT *>(m->one_ptr),
+                           weight_type,
+                           1,
+                           &alpha,
+                           output_ptr,
+                           output_type,
+                           out_dim,
+                           compute_type,
+                           CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+  }
+  if (use_activation(m->activation)) {
+    checkCUDNN(cudnnActivationForward(m->handle.dnn,
+                                      m->actiDesc,
+                                      &alpha,
+                                      m->outputTensor,
+                                      output_ptr,
+                                      &beta,
+                                      m->outputTensor,
+                                      output_ptr));
+  } else if (m->activation == AC_MODE_GELU) {
+    size_t elements = (size_t)out_dim * (size_t)batch_size;
+    constexpr float B = 0.7978845608028654f;   // sqrt(2.0/M_PI)
+    constexpr float C = 0.035677408136300125f; // 0.044715 * sqrt(2.0/M_PI)
+    gelu_forward_kernel<<<GET_BLOCKS(elements), CUDA_NUM_THREADS>>>(
+        elements, B, C, (float *)output_ptr);
+  } else if (m->activation == AC_MODE_NONE) {
+    // Do nothing
+  } else {
+    assert(false && "Unsupported activation for Linear");
+  }
+}
+
+template <typename DT>
+LinearFunctionType LinearKernelSelector::selectLinearForwardKernel(int in_dim, int out_dim, int batch_size){
+  std::vector<LinearFunctionType> possible_functions;
+  possible_functions.push_back(cublas_forward_kernel<DT>);
+  return possible_functions[0];
+}
+
 bool use_activation(ActiMode mode) {
   switch (mode) {
     case AC_MODE_RELU:
@@ -262,127 +402,17 @@ void forward_kernel(LinearMeta const *m,
                     int out_dim,
                     int batch_size,
                     ffStream_t stream) {
-  // additional processing for uploading weights
-  if (m->offload) {
-    // Note that we update weight_ptr when uploading weight
-    if (m->quantization_type != DT_NONE) {
-      cudaMemcpyAsync(m->quantized_weight_ptr,
-                      weight_ptr,
-                      m->quantized_weightSize,
-                      cudaMemcpyHostToDevice,
-                      stream);
-      if (m->quantization_type == DT_INT4) {
-        int parallelism = in_dim * out_dim / 2;
-        decompress_int4_general_weights<DT>
-            <<<GET_BLOCKS(parallelism),
-               min(CUDA_NUM_THREADS, parallelism),
-               0,
-               stream>>>(m->quantized_weight_ptr,
-                         static_cast<DT *>(m->weight_ptr),
-                         in_dim,
-                         in_dim * out_dim);
-      } else {
-        assert(m->quantization_type == DT_INT8);
-        int parallelism = in_dim * out_dim;
-        decompress_int8_general_weights<DT>
-            <<<GET_BLOCKS(parallelism),
-               min(CUDA_NUM_THREADS, parallelism),
-               0,
-               stream>>>(m->quantized_weight_ptr,
-                         static_cast<DT *>(m->weight_ptr),
-                         in_dim,
-                         in_dim * out_dim);
-      }
-
-    } else {
-      cudaMemcpyAsync(m->weight_ptr,
-                      weight_ptr,
-                      in_dim * out_dim * sizeof(DT),
-                      cudaMemcpyHostToDevice,
-                      stream);
-    }
-  }
+  LinearKernelSelector kernel_selector;
   checkCUDA(cublasSetStream(m->handle.blas, stream));
   checkCUDNN(cudnnSetStream(m->handle.dnn, stream));
-  DT alpha = 1.0f, beta = 0.0f;
-  cudaDataType_t input_type = ff_to_cuda_datatype(m->input_type[0]);
-  cudaDataType_t weight_type = m->offload
-                                   ? ff_to_cuda_datatype(m->weight_ptr_type)
-                                   : ff_to_cuda_datatype(m->weight_type[0]);
-  cudaDataType_t output_type = ff_to_cuda_datatype(m->output_type[0]);
-  assert(input_type == weight_type && weight_type == output_type);
-#if defined(CUDA_VERSION) && (CUDA_VERSION < 11000)
-  cudaDataType_t compute_type = cublas_data_type;
-#else
-  // For best performance, set the default cublas compute type to
-  // CUBLAS_COMPUTE_16F for half precision and to
-  // CUBLAS_COMPUTE_32F_FAST_16F for full precision
-  cublasComputeType_t compute_type = CUBLAS_COMPUTE_16F;
-  if (m->output_type[0] == DT_FLOAT) {
-    compute_type = CUBLAS_COMPUTE_32F_FAST_16F;
-  }
-#endif
-  checkCUDA(cublasGemmEx(m->handle.blas,
-                         CUBLAS_OP_T,
-                         CUBLAS_OP_N,
-                         out_dim,
-                         batch_size,
-                         in_dim,
-                         &alpha,
-                         m->offload ? m->weight_ptr : weight_ptr,
-                         weight_type,
-                         in_dim,
-                         input_ptr,
-                         input_type,
-                         in_dim,
-                         &beta,
-                         output_ptr,
-                         output_type,
-                         out_dim,
-                         compute_type,
-                         CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-  // use_bias = True
-  if (bias_ptr != NULL) {
-    checkCUDA(cublasGemmEx(m->handle.blas,
-                           CUBLAS_OP_T,
-                           CUBLAS_OP_N,
-                           out_dim,
-                           batch_size,
-                           1,
-                           &alpha,
-                           bias_ptr,
-                           weight_type,
-                           1,
-                           static_cast<DT *>(m->one_ptr),
-                           weight_type,
-                           1,
-                           &alpha,
-                           output_ptr,
-                           output_type,
-                           out_dim,
-                           compute_type,
-                           CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-  }
-  if (use_activation(m->activation)) {
-    checkCUDNN(cudnnActivationForward(m->handle.dnn,
-                                      m->actiDesc,
-                                      &alpha,
-                                      m->outputTensor,
-                                      output_ptr,
-                                      &beta,
-                                      m->outputTensor,
-                                      output_ptr));
-  } else if (m->activation == AC_MODE_GELU) {
-    size_t elements = (size_t)out_dim * (size_t)batch_size;
-    constexpr float B = 0.7978845608028654f;   // sqrt(2.0/M_PI)
-    constexpr float C = 0.035677408136300125f; // 0.044715 * sqrt(2.0/M_PI)
-    gelu_forward_kernel<<<GET_BLOCKS(elements), CUDA_NUM_THREADS>>>(
-        elements, B, C, (float *)output_ptr);
-  } else if (m->activation == AC_MODE_NONE) {
-    // Do nothing
-  } else {
-    assert(false && "Unsupported activation for Linear");
-  }
+
+  LinearFunctionType forward_algo;
+  #if true
+  forward_algo = kernel_selector.selectLinearForwardKernel<DT>(in_dim, out_dim, batch_size);
+  #else
+  forward_algo = cublas_forward_kernel<DT>;
+  #endif
+  forward_algo(m, input_ptr, output_ptr, weight_ptr, bias_ptr, in_dim, out_dim, batch_size, stream);
 }
 
 template <typename DT>

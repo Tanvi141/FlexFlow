@@ -5,6 +5,8 @@
 #include "flexflow/fftype.h"
 #include "flexflow/op_meta.h"
 #include "flexflow/ops/linear.h"
+#include <unordered_map>
+#include <vector>
 
 namespace FlexFlow {
 
@@ -37,8 +39,27 @@ public:
   Realm::RegionInstance reserveInst;
 };
 
+using LinearFunctionType = std::function<void(LinearMeta const *,
+                  void const *,
+                  void *,
+                  void const *,
+                  void const *,
+                  int,
+                  int,
+                  int,
+                  ffStream_t)>;
+
 namespace Kernels {
 namespace Linear {
+
+class LinearKernelSelector {
+public:
+  template <typename DT>
+  LinearFunctionType selectLinearForwardKernel(int in_dim, int out_dim, int batch_size);
+private:
+  std::map<std::vector<int>, LinearFunctionType> cache;
+};
+
 void init_kernel(LinearMeta *m, int batch_size, int channel);
 void forward_kernel_wrapper(LinearMeta const *m,
                             void const *input_ptr,
