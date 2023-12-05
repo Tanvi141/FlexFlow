@@ -208,6 +208,12 @@ set(NVCC_FLAGS $ENV{NVCC_FLAGS})
 set(LD_FLAGS $ENV{LD_FLAGS})
 
 # Set global FLAGS
+list(APPEND NVCC_FLAGS
+  -I/home/ubuntu/cutlass/include)
+
+list(APPEND NVCC_FLAGS
+  -I/home/ubuntu/cutlass/tools/util/include)
+
 list(APPEND CC_FLAGS
   -std=c++17)
 list(APPEND NVCC_FLAGS

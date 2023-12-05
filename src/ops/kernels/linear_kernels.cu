@@ -208,10 +208,20 @@ void cublas_forward_kernel(LinearMeta const *m,
 }
 
 template <typename DT>
-LinearFunctionType LinearKernelSelector::selectLinearForwardKernel(int in_dim, int out_dim, int batch_size){
+LinearFunctionType LinearKernelSelector::selectLinearForwardKernel(int in_dim, int out_dim, int batch_size, ActiMode activation){
+  std::pair<ActiMode, std::vector<int>> map_key = std::make_pair(activation, std::vector<int>{in_dim, out_dim, batch_size});
+
+  if (cache.find(map_key) != cache.end()){
+    std::cout<<"Found cached kernel\n";
+    return cache[map_key];
+  }
+
   std::vector<LinearFunctionType> possible_functions;
   possible_functions.push_back(cublas_forward_kernel<DT>);
-  return possible_functions[0];
+
+  cache[map_key] = possible_functions[0];
+  std::cout<<"Benchmarked and found best to be kernel\n";
+  return cache[map_key];
 }
 
 bool use_activation(ActiMode mode) {
@@ -408,7 +418,7 @@ void forward_kernel(LinearMeta const *m,
 
   LinearFunctionType forward_algo;
   #if true
-  forward_algo = kernel_selector.selectLinearForwardKernel<DT>(in_dim, out_dim, batch_size);
+  forward_algo = kernel_selector.selectLinearForwardKernel<DT>(in_dim, out_dim, batch_size, m->activation);
   #else
   forward_algo = cublas_forward_kernel<DT>;
   #endif

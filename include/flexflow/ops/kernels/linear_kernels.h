@@ -55,9 +55,9 @@ namespace Linear {
 class LinearKernelSelector {
 public:
   template <typename DT>
-  LinearFunctionType selectLinearForwardKernel(int in_dim, int out_dim, int batch_size);
+  LinearFunctionType selectLinearForwardKernel(int in_dim, int out_dim, int batch_size, ActiMode activation);
 private:
-  std::map<std::vector<int>, LinearFunctionType> cache;
+  static inline std::map<std::pair<ActiMode, std::vector<int>>, LinearFunctionType> cache{};
 };
 
 void init_kernel(LinearMeta *m, int batch_size, int channel);
