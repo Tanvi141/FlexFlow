@@ -11,7 +11,7 @@ def top_level_task(test_type=1):
   print("Python API batchSize(%d) workersPerNodes(%d) numNodes(%d)" %(ffconfig.batch_size, ffconfig.workers_per_node, ffconfig.num_nodes))
   ffmodel = FFModel(ffconfig)
   
-  dims1 = [ffconfig.batch_size, 784]
+  dims1 = [ffconfig.batch_size, 512]
   input1 = ffmodel.create_tensor(dims1, DataType.DT_FLOAT);
   
   num_samples = 60000
@@ -31,6 +31,8 @@ def top_level_task(test_type=1):
   (x_train, y_train), (x_test, y_test) = mnist.load_data()
 
   x_train = x_train.reshape(60000, 784)
+  x_train = x_train[:, 512]
+  print("shape", x_train.shape)
   x_train = x_train.astype('float32')
   x_train /= 255
   y_train = y_train.astype('int32')

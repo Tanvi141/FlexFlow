@@ -18,6 +18,23 @@
 #include "flexflow/ops/kernels/linear_kernels.h"
 #include "flexflow/utils/cuda_helper.h"
 
+#include "cutlass/cutlass.h"
+#include "cutlass/gemm/device/gemm.h"
+#include "cutlass/epilogue/thread/linear_combination_relu.h"
+#include "cutlass/util/host_tensor.h"
+#include "cutlass/util/reference/device/gemm.h"
+#include "cutlass/util/reference/host/tensor_fill.h"
+
+#define CUTLASS_CHECK(status)                                                                    \
+  {                                                                                              \
+    cutlass::Status error = status;                                                              \
+    if (error != cutlass::Status::kSuccess) {                                                    \
+      std::cerr << "Got cutlass error: " << cutlassGetStatusString(error) << " at: " << __LINE__ \
+                << std::endl;                                                                    \
+      exit(EXIT_FAILURE);                                                                        \
+    }                                                                                            \
+  }
+
 namespace FlexFlow {
 
 LinearMeta::LinearMeta(FFHandler handler,
@@ -73,6 +90,179 @@ LinearMeta::~LinearMeta(void) {
 
 namespace Kernels {
 namespace Linear {
+
+template <typename DT>
+void cutlass_matmul_relu(LinearMeta const *m, 
+        void const *input_ptr,
+        void *output_ptr,
+        void const *weight_ptr,
+        void const *bias_ptr,
+        int in_dim,
+        int out_dim,
+        int batch_size,
+        ffStream_t stream) {
+  
+  std::cout<<"in_dim="<<in_dim<<" out_dim="<<out_dim<<" batch_size="<<batch_size<<"\n";
+  // The code section below describes datatype for input, output matrices and computation between
+  // elements in input matrices.
+  using ElementAccumulator = float;                   // <- data type of accumulator
+  using ElementComputeEpilogue = ElementAccumulator;  // <- data type of epilogue operations
+  using ElementInputA = cutlass::half_t;              // <- data type of elements in input matrix A
+  using ElementInputB = cutlass::half_t;              // <- data type of elements in input matrix B
+  using ElementOutput = float;                        // <- data type of elements in output matrix D
+
+  using LayoutInputA = cutlass::layout::ColumnMajor;
+  using LayoutInputB = cutlass::layout::ColumnMajor;
+  using LayoutOutput = cutlass::layout::ColumnMajor;
+
+  // Define the epilogue operation as LinearCombinationRelu. This is approximately equal to
+  //
+  //    d_ij = max(0, alpha * sum_k(a_ik * b_kj) + c_ij )
+  //
+  using EpilogueOp = cutlass::epilogue::thread::LinearCombinationRelu<
+      ElementOutput,                                        // <- data type of output matrix
+      128 / cutlass::sizeof_bits<ElementOutput>::value,     // <- this is the number of elements per
+                                                            // vectorized memory access. For half
+                                                            // precision, it's 8 elements. This becomes
+                                                            // the vector width of math instructions in
+                                                            // epilogue too
+      ElementAccumulator,                                   // <- data type of accumulator
+      ElementComputeEpilogue,                               // <- data type for alpha in linear combination function
+      cutlass::epilogue::thread::ScaleType::NoBetaScaling>; // <- alpha x C + bias
+
+  // Number of pipelines you want to use
+  constexpr int NumStages = 2;
+
+  using Gemm = cutlass::gemm::device::Gemm<ElementInputA,
+                                          LayoutInputA,
+                                          ElementInputB,
+                                          LayoutInputB,
+                                          ElementOutput,
+                                          LayoutOutput,
+                                          ElementAccumulator,
+                                          cutlass::arch::OpClassTensorOp,
+                                          cutlass::arch::Sm75,
+                                          cutlass::gemm::GemmShape<128, 128, 32>,
+                                          cutlass::gemm::GemmShape<64, 64, 32>,
+                                          cutlass::gemm::GemmShape<16, 8, 8>,
+                                          EpilogueOp,
+                                          cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
+                                          NumStages>;
+
+
+  // Create a tuple of problem size for matrix multiplication
+  cutlass::gemm::GemmCoord problem_size(out_dim, batch_size, in_dim);
+
+  // Initialize tensors using CUTLASS helper functions
+  cutlass::HostTensor<ElementInputA, LayoutInputA> tensor_a(
+      problem_size.mk());  // <- Create matrix A with dimensions M x K
+
+  cutlass::HostTensor<ElementInputB, LayoutInputB> tensor_b(
+      problem_size.kn());  // <- Create matrix B with dimensions K x N
+
+  cutlass::HostTensor<ElementOutput, LayoutOutput> tensor_c_bias(
+      {problem_size.m(), 1});  // <- Create matrix C with dimensions M x 1
+
+  cutlass::HostTensor<ElementOutput, LayoutOutput> tensor_d(
+      problem_size.mn());  // <- Create matrix D with dimensions M x N used to store output from
+                           // CUTLASS kernel
+
+  const DT* weight_reinterpret = reinterpret_cast<const DT*>(weight_ptr);
+
+  for (int col=0; col<out_dim; col++){
+    for (int row=0; row<in_dim; row++) {
+      tensor_a.at({col, row}) = weight_reinterpret[col*in_dim + row];
+    }
+  }
+
+  const DT* input_reinterpret = reinterpret_cast<const DT*>(input_ptr);
+
+  for (int col=0; col<out_dim; col++){
+    for (int row=0; row<in_dim; row++) {
+      tensor_b.at({row, col}) = input_reinterpret[col*in_dim + row];
+    }
+  }
+
+  if (bias_ptr != nullptr) {
+    const DT* bias_reinterpret = reinterpret_cast<const DT*>(bias_ptr);
+
+    for (int col=0; col<out_dim; col++){
+        tensor_c_bias.at({col, 0}) = bias_reinterpret[col];
+    }
+  }
+  else 
+  {
+    cutlass::reference::host::TensorFill(
+      tensor_c_bias.host_view());
+  }
+
+
+  cutlass::reference::host::TensorFill(
+      tensor_d.host_view());  // <- fill matrix D on host with zeros
+
+  // Copy data from host to GPU
+  tensor_a.sync_device();
+  tensor_b.sync_device();
+  tensor_c_bias.sync_device();
+  tensor_d.sync_device();
+  // tensor_ref_d.sync_device();
+
+
+  // Initialize alpha for dot product computation
+  ElementComputeEpilogue alpha = ElementComputeEpilogue(1);
+
+  // Split K dimension into 1 partitions
+  int split_k_slices = 1;
+
+  // Create a tuple of gemm kernel arguments. This is later passed as arguments to launch
+  // instantiated CUTLASS kernel
+  typename Gemm::Arguments arguments{
+    problem_size,                       // <- problem size of matrix multiplication
+    tensor_a.device_ref(),              // <- reference to matrix A on device
+    tensor_b.device_ref(),              // <- reference to matrix B on device
+
+    {tensor_c_bias.device_data(), 0},   // <- the C matrix is treated as the bias vector. We can enable the GEMM
+                                        //    to project away the N dimension by setting the stride to zero.
+
+    tensor_d.device_ref(),              // <- reference to matrix D on device
+    {alpha},                              // <- alpha
+    split_k_slices};                    // <- k-dimension split factor
+
+  // Using the arguments, query for extra workspace required for matrix multiplication computation
+  size_t workspace_size = Gemm::get_workspace_size(arguments);
+
+  // Allocate workspace memory
+  cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
+
+  // Instantiate CUTLASS kernel depending on templates
+  Gemm gemm_op;
+
+  // Check the problem size is supported or not 
+  cutlass::Status status = gemm_op.can_implement(arguments);
+  CUTLASS_CHECK(status);
+
+  // Initialize CUTLASS kernel with arguments and workspace pointer
+  status = gemm_op.initialize(arguments, workspace.get());
+  CUTLASS_CHECK(status);
+
+  // Launch initialized CUTLASS kernel
+  status = gemm_op();
+  CUTLASS_CHECK(status);
+
+  // Wait for kernels to finish
+  cudaDeviceSynchronize();
+
+  // Copy output data from CUTLASS and reference kernel to host for comparison
+  tensor_d.sync_host();
+
+  DT* output_reinterpret = reinterpret_cast<DT*>(output_ptr);
+
+  for (int col=0; col<batch_size; col++){
+    for (int row=0; row<out_dim; row++) {
+      output_reinterpret[col*out_dim + row] = tensor_d.at({row, col});
+    }
+  }
+}
 
 template <typename DT>
 void cublas_forward_kernel(LinearMeta const *m,
@@ -218,6 +408,7 @@ LinearFunctionType LinearKernelSelector::selectLinearForwardKernel(int in_dim, i
 
   std::vector<LinearFunctionType> possible_functions;
   possible_functions.push_back(cublas_forward_kernel<DT>);
+  // possible_functions.push_back(cutlass_matmul_relu<DT>);
 
   cache[map_key] = possible_functions[0];
   std::cout<<"Benchmarked and found best to be kernel\n";
@@ -418,7 +609,7 @@ void forward_kernel(LinearMeta const *m,
 
   LinearFunctionType forward_algo;
   #if true
-  forward_algo = kernel_selector.selectLinearForwardKernel<DT>(in_dim, out_dim, batch_size, m->activation);
+  forward_algo = cutlass_matmul_relu<DT>; //kernel_selector.selectLinearForwardKernel<DT>(in_dim, out_dim, batch_size, m->activation);
   #else
   forward_algo = cublas_forward_kernel<DT>;
   #endif
